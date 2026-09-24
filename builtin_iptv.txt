@@ -1,10 +1,6 @@
 潮汕频道,#genre#
 汕头新闻综合,sttv://st1
 汕头经济生活,sttv://st2
-潮州综合,webview://https://liveshowapp.kanchaozhou.com/web/fslivemobile/index.html?id=1101&domain=https://app.kanchaozhou.com
-潮州民生,webview://https://liveshowapp.kanchaozhou.com/web/fslivemobile/index.html?id=1102&domain=https://app.kanchaozhou.com
-揭阳新闻综合,webview://https://www.jyrtv.tv/fccommon/Home/detail?site_id=75&detail_type=7&cid=11
-揭阳生活,webview://https://www.jyrtv.tv/fccommon/Home/detail?site_id=75&detail_type=7&cid=12
 
 广东频道,#genre#
 广东卫视,http://124.228.160.112:9901/tsfile/live/0125_1.m3u8?key=txiptv&playlive=1&authid=0#http://120.76.248.139/live/bfgd/4200000092.m3u8#http://61.136.172.236:9901/tsfile/live/0125_1.m3u8#http://112.123.243.37:50085/tsfile/live/0135_1.m3u8?key=txiptv&playlive=0&authid=0#webview://http://gdtv.cn/tvChannelDetail/43#webview://https://yangshipin.cn/tv/home?pid=600002485
