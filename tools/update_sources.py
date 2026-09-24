@@ -375,9 +375,11 @@ def main():
           f"固定条目 {stats['stable']} 条", file=sys.stderr)
 
     if dead_pinned:
-        print(f"\n⚠️  注意：{len(dead_pinned)} 条官方 CDN 三次重试后仍不可达（已保留，未删除）。"
-              f"若非网络问题而是真失效，说明央视 CDN 有变动，届时从新版 tv-go 镜像的"
-              f" cctv_streams.json 抄一批新地址:", file=sys.stderr)
+        print(f"\n提示：{len(dead_pinned)} 条官方 CDN 三次重试后仍不可达（已保留，未删除）。", file=sys.stderr)
+        print(f"      若本流水线跑在 GitHub 海外机房，这是正常现象 —— 部分国内 CDN 节点从境外"
+              f"连不上，但在国内可达（实测云端约 75/90、本地约 90/90）。", file=sys.stderr)
+        print(f"      只有在**国内网络**下也大面积不可达时，才说明央视 CDN 真有变动，"
+              f"届时从新版 tv-go 镜像的 cctv_streams.json 抄一批新地址:", file=sys.stderr)
         for u in dead_pinned:
             print(f"    ✗ {u}", file=sys.stderr)
 
