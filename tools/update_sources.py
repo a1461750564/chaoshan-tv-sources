@@ -149,6 +149,63 @@ def _get(url, timeout=10, limit=None):
     return r.status, r.headers.get("Content-Type", ""), (r.read() if limit is None else r.read(limit))
 
 
+# PMT 里代表「有画面」的 stream_type
+# 0x01 MPEG-1 / 0x02 MPEG-2 / 0x10 MPEG-4 / 0x1B H.264 / 0x1E H.264-MVC
+# 0x24 H.265 / 0x42 AVS / 0xD1 Dirac / 0xEA VC-1
+_VIDEO_STREAM_TYPES = {0x01, 0x02, 0x10, 0x1B, 0x1E, 0x24, 0x42, 0xD1, 0xEA}
+
+
+def ts_has_video(data: bytes):
+    """从 TS 分片判断有没有画面。
+
+    返回 True=有视频 / False=纯音频 / None=判不了（非 TS，保守放行）
+
+    为什么要查这个：公开源里混着一批 `…/audio/cctv3_2.m3u8` 这类**纯音频**地址，
+    它们能通过前面三级检测（连通、真 HLS、首片能拉），但播出来是**黑屏只有声音**。
+    实测 CCTV16 的第 1 条就是这种，会直接顶掉真正的视频线路。
+    """
+    pkts = [data[i:i + 188] for i in range(0, len(data) - 187, 188)]
+    pkts = [p for p in pkts if p[0] == 0x47]
+    if len(pkts) < 10:
+        return None
+
+    def payload(p):
+        af = (p[3] >> 4) & 0x3
+        q = (5 + p[4]) if af in (2, 3) else 4
+        if q >= len(p):
+            return None
+        return p[q + 1 + p[q]:] if p[q] < len(p) else None
+
+    pmt_pid = None
+    for p in pkts:                                                  # PAT → PMT PID
+        if ((p[1] & 0x1f) << 8 | p[2]) == 0 and (p[1] & 0x40):
+            s = payload(p)
+            if s and s[0] == 0x00:
+                end = 3 + (((s[1] & 0xf) << 8) | s[2]) - 4
+                for i in range(8, min(end, len(s) - 4), 4):
+                    if ((s[i] << 8) | s[i + 1]) != 0:
+                        pmt_pid = ((s[i + 2] & 0x1f) << 8) | s[i + 3]
+                        break
+            break
+    if pmt_pid is None:
+        return None
+
+    for p in pkts:                                                  # PMT → 流类型表
+        if ((p[1] & 0x1f) << 8 | p[2]) == pmt_pid and (p[1] & 0x40):
+            s = payload(p)
+            if s and s[0] == 0x02:
+                end = 3 + (((s[1] & 0xf) << 8) | s[2]) - 4
+                i = 12 + (((s[10] & 0xf) << 8) | s[11])
+                types = []
+                while i + 5 <= min(end, len(s)):
+                    types.append(s[i])
+                    i += 5 + (((s[i + 3] & 0xf) << 8) | s[i + 4])
+                if types:
+                    return any(t in _VIDEO_STREAM_TYPES for t in types)
+            break
+    return None
+
+
 def probe(item):
     """通过返回 (频道名, url)，否则 None
 
@@ -164,9 +221,15 @@ def probe(item):
                 if l.strip() and not l.startswith("#")]
         if not segs or len(segs) > 300:                             # ③ 分片数合理
             return None                                             #    超过 300 基本是点播切片
-        st2, ct2, _ = _get(urljoin(url, segs[0]), 12, 1)            #    首分片真能拉
-        if st2 == 200 and ("video" in ct2 or "octet" in ct2 or not ct2):
-            return (name, url)
+        # 首分片真能拉，且**要有画面**
+        st2, ct2, seg = _get(urljoin(url, segs[0]), 12, 65536)
+        if st2 != 200 or not ("video" in ct2 or "octet" in ct2 or not ct2):
+            return None
+        if ct2.startswith("audio") or "/audio/" in url.lower():
+            return None                                             #    明摆着的音频地址
+        if ts_has_video(seg) is False:
+            return None                                             #    PMT 里只有音频流
+        return (name, url)
     except Exception:
         pass
     return None
