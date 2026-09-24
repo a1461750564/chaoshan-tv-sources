@@ -206,6 +206,29 @@ def ts_has_video(data: bytes):
     return None
 
 
+def first_segment(url, text, depth=0):
+    """拉取「首个真正能播的片段」，返回 (url, content_type, 数据) 或 None。
+
+    很多源是**主播放列表**（外层 m3u8 列的是不同码率的子播放列表，子播放列表才是切片）。
+    只下钻一层、把子播放列表当切片去拉，拿回来还是 m3u8，就会被误判成"拉不到"。
+    实测广东的源里大量是这种结构（`epg.pw`、`jdshipin` 等），
+    修掉它对所有频道的候选命中率都有帮助，不只是广东。
+
+    depth 限制 2 层，防止自引用导致死循环。
+    """
+    segs = [l.strip() for l in text.splitlines()
+            if l.strip() and not l.startswith("#")]
+    if not segs or len(segs) > 300:                                 # 分片数合理
+        return None                                                 # 超过 300 基本是点播切片
+    seg_url = urljoin(url, segs[0])
+    st, ct, body = _get(seg_url, 12, 65536)
+    if st != 200:
+        return None
+    if body.lstrip()[:7] == b"#EXTM3U" and depth < 2:               # 还是播放列表 → 下钻
+        return first_segment(seg_url, body.decode("utf-8", "ignore"), depth + 1)
+    return seg_url, ct, body
+
+
 def probe(item):
     """通过返回 (频道名, url)，否则 None
 
@@ -217,19 +240,18 @@ def probe(item):
         text = body.decode("utf-8", "ignore").lstrip()
         if not text.startswith("#EXTM3U"):                          # ② 必须是真的 HLS
             return None                                             #    否则可能是 MP4（首行 ftypqt）
-        segs = [l.strip() for l in text.splitlines()
-                if l.strip() and not l.startswith("#")]
-        if not segs or len(segs) > 300:                             # ③ 分片数合理
-            return None                                             #    超过 300 基本是点播切片
-        # 首分片真能拉，且**要有画面**
-        st2, ct2, seg = _get(urljoin(url, segs[0]), 12, 65536)
-        if st2 != 200 or not ("video" in ct2 or "octet" in ct2 or not ct2):
+        got = first_segment(url, text)                              # ③ 首分片真能拉（自动下钻主播放列表）
+        if got is None:
             return None
-        if ct2.startswith("audio") or "/audio/" in url.lower():
-            return None                                             #    明摆着的音频地址
-        if ts_has_video(seg) is False:
-            return None                                             #    PMT 里只有音频流
-        return (name, url)
+        seg_url, ct2, seg = got
+        if "/audio/" in url.lower() or ct2.startswith("audio"):      # ④ 明摆着的音频地址
+            return None
+        # ⑤ 要有画面。注意判据是「TS 同步字节 + PMT」，不认 content-type ——
+        #    不少源把 TS 分片标成 text/plain 或干脆不给 type，卡 content-type 会误杀。
+        if seg[:1] == b"\x47" or ct2.startswith("video") or ct2.startswith("octet"):
+            if ts_has_video(seg) is False:
+                return None                                         #    PMT 里只有音频流
+            return (name, url)
     except Exception:
         pass
     return None
