@@ -1,0 +1,71 @@
+name: 更新直播源
+
+# 公开 IPTV 源平均寿命以天计 —— 每天自动重跑检测流水线，
+# 把过期条目换掉。App 侧按缓存周期自动拉到新版。
+#
+# 本仓库**只放更新所需的三个文件**，不含 App 源码：
+#   builtin_iptv.txt            播放列表（骨架 + 输出）
+#   tools/update_sources.py     检测流水线（只用标准库，无需 pip install）
+#   本文件                       定时任务
+on:
+  schedule:
+    # 每天 UTC 20:10（北京时间 04:10），避开整点高峰
+    - cron: '10 20 * * *'
+  workflow_dispatch:        # 也支持手动触发
+
+permissions:
+  contents: write           # 需要提交更新后的播放列表
+
+concurrency:
+  group: update-sources
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 跑检测流水线
+        run: |
+          python3 tools/update_sources.py \
+            --playlist builtin_iptv.txt \
+            --out      builtin_iptv.txt
+
+      - name: 检查是否有变化
+        id: diff
+        run: |
+          if git diff --quiet -- builtin_iptv.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "源无变化，跳过提交"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "--- 变化统计 ---"
+            git diff --stat -- builtin_iptv.txt
+          fi
+
+      - name: 提交
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add builtin_iptv.txt
+          git commit -m "chore: 自动更新直播源 $(date -u '+%Y-%m-%d')"
+          git push
+
+      # 供 App 直接拉取的稳定地址（raw.githubusercontent.com 会缓存几分钟）
+      - name: 输出拉取地址
+        run: |
+          echo "### App 拉取地址" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/builtin_iptv.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "把这个地址填进 App 的 \`Constants.BUILTIN_IPTV_UPDATE_URL\` 即可启用自动更新。" >> "$GITHUB_STEP_SUMMARY"
