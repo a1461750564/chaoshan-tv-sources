@@ -343,20 +343,41 @@ def find_foreign_hosts(hosts):
 
     为什么要这一步
     --------------
-    公开源里混着境外的转播服务器。实测整个播放列表 61 个主机里只有一个是境外的
-    —— `74.91.26.218:82`（美国密苏里 Nocix 机房，org "Chengdu Zhimeng"），
-    而一台机器就转发了 31 个央视频道（cctv1hd ~ cctv17hd）。
-    它恰好被排在了 **CCTV1 和 CCTV9 的第 1 条线路**上。
+    公开源里混着境外的转播服务器。实测有一个 `74.91.26.218:82`
+    （美国密苏里 Nocix 机房，org "Chengdu Zhimeng"），一台机器转发 31 个央视频道
+    （cctv1hd ~ cctv17hd），而它恰好被排在了 **CCTV1 和 CCTV9 的第 1 条线路**上。
 
     对国内用户的坏处有两层：
     1. **信号可能不是国内版**。境外转播常见的是「海外版」信号，广告甚至节目都与
        国内版不同 —— 用户实测反馈「CCTV1 第一个源是个广告」，与此吻合。
     2. **链路绕远**。视频要从国内传到美国再拉回来，延迟和稳定性都差。
 
-    所以降级到列表末尾：留着当最后的兜底，但永不优先。
+    ⚠️ 判据只认**裸 IP 主机**，域名一律放行
+    ----------------------------------------
+    第一版把「解析出的 IP 在境外」当作境外，结果在 GitHub 美国机房跑时把
+    `t.live.cntv.cn`（央视网）、`ali-xwl.cztv.com`（浙江广电）、
+    `hlsal-ldvt.qing.mgtv.com`（芒果TV）等 8 个**国内 CDN 域名**也判成了境外。
+
+    原因是 CDN 域名**按 DNS 位置就近解析**：从美国解析自然落到海外节点，
+    但在国内解析走的是国内节点 —— 对用户毫无坏处。
+
+    而 `74.91.26.218:82` 这种**裸 IP 是钉死在物理位置**的，无论谁访问都出国。
+    所以只降级「裸 IP 且境外」的主机，域名交给 DNS 自己就近路由。
     """
+    def is_bare_ip(host):
+        hn = host.split(":")[0]
+        try:
+            socket.inet_aton(hn)
+            return True
+        except OSError:
+            return False
+
+    bare = {h for h in hosts if is_bare_ip(h)}
+    if not bare:
+        return set()
+
     ip_of = {}
-    for h in hosts:
+    for h in bare:
         try:
             ip_of[h] = socket.gethostbyname(h.split(":")[0])
         except Exception:
