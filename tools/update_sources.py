@@ -33,7 +33,7 @@
 只依赖标准库，GitHub Actions 无需 pip install。
 """
 
-import argparse, os, re, socket, ssl, sys, time
+import argparse, json, os, re, socket, ssl, sys, time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit, quote
@@ -141,6 +141,14 @@ def is_pinned(u: str) -> bool:
     except ValueError:
         return False
     return any(host.endswith(h) for h in PINNED_HOSTS)
+
+
+def host_of(u: str) -> str:
+    """取 URL 的 host[:port]，用于归属地判断"""
+    try:
+        return urlsplit(u).netloc
+    except ValueError:
+        return ""
 
 
 # ── 三级检测 ─────────────────────────────────────────────────────────
@@ -273,6 +281,55 @@ def probe_pinned(item, tries=3):
     return None
 
 
+# ── 主机归属地：把境外转播源降到最后 ─────────────────────────────────
+GEO_API = "http://ip-api.com/batch?fields=query,countryCode"
+
+
+def find_foreign_hosts(hosts):
+    """返回其中的**境外**主机集合。查不到就返回空集（best-effort，不阻塞主流程）。
+
+    为什么要这一步
+    --------------
+    公开源里混着境外的转播服务器。实测整个播放列表 61 个主机里只有一个是境外的
+    —— `74.91.26.218:82`（美国密苏里 Nocix 机房，org "Chengdu Zhimeng"），
+    而一台机器就转发了 31 个央视频道（cctv1hd ~ cctv17hd）。
+    它恰好被排在了 **CCTV1 和 CCTV9 的第 1 条线路**上。
+
+    对国内用户的坏处有两层：
+    1. **信号可能不是国内版**。境外转播常见的是「海外版」信号，广告甚至节目都与
+       国内版不同 —— 用户实测反馈「CCTV1 第一个源是个广告」，与此吻合。
+    2. **链路绕远**。视频要从国内传到美国再拉回来，延迟和稳定性都差。
+
+    所以降级到列表末尾：留着当最后的兜底，但永不优先。
+    """
+    ip_of = {}
+    for h in hosts:
+        try:
+            ip_of[h] = socket.gethostbyname(h.split(":")[0])
+        except Exception:
+            continue
+    uniq = sorted(set(ip_of.values()))
+    if not uniq:
+        return set()
+    foreign_ips = set()
+    for i in range(0, len(uniq), 100):                      # API 每批上限 100
+        try:
+            req = urllib.request.Request(
+                GEO_API,
+                data=json.dumps(uniq[i:i + 100]).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            for it in json.loads(urllib.request.urlopen(req, timeout=20).read().decode()):
+                code = it.get("countryCode")
+                if code and code != "CN":
+                    foreign_ips.add(it.get("query"))
+        except Exception as e:
+            print(f"  [归属地] 查询失败（跳过，不影响主流程）: {type(e).__name__}",
+                  file=sys.stderr)
+            return set()
+    return {h for h, ip in ip_of.items() if ip in foreign_ips}
+
+
 # ── 骨架解析 / 生成 ──────────────────────────────────────────────────
 def read_skeleton(path):
     """返回 [(分组名 or None, 频道名, [线路...])]，顺序与文件一致"""
@@ -398,10 +455,23 @@ def main():
         if len(fresh[n]) < MAX_DIRECT:
             fresh[n].append(u)
 
+    # 查一遍主机归属地，把境外转播源降到最后（详见 find_foreign_hosts 注释）
+    all_hosts = {host_of(u) for n, u in results}
+    all_hosts |= {host_of(u) for _g, _n, us in skeleton for u in us
+                  if u.startswith("http")}
+    all_hosts.discard("")
+    print(f"检查 {len(all_hosts)} 个主机的归属地...", file=sys.stderr)
+    FOREIGN = find_foreign_hosts(all_hosts)
+    if FOREIGN:
+        print(f"  境外主机 {len(FOREIGN)} 个（将排到各频道最后）: "
+              f"{', '.join(sorted(FOREIGN))}", file=sys.stderr)
+    else:
+        print("  全部境内（或查询失败）", file=sys.stderr)
+
     # ── 生成：骨架顺序不变，http 部分换成新测的，非 http 部分原样保留 ──
     out_lines = []
     last_group = None
-    stats = {"fresh": 0, "stable": 0, "pinned": 0, "direct_channels": 0}
+    stats = {"fresh": 0, "stable": 0, "pinned": 0, "direct_channels": 0, "overseas": 0}
 
     for group, name, urls in skeleton:
         if group != last_group:
@@ -429,9 +499,13 @@ def main():
         # 公开聚合源里已经出现了官方 CDN 地址（实测 best-fan 等已收录 wscdns），
         # 必须把它们从「公开段」剔除 —— 否则又会被排到第一位，回到绿屏卡死的老问题。
         # 它们由 pinned 段统一承载，位置在后备层。
-        merged_http = [u for u in merged_http if not is_pinned(u)][:MAX_DIRECT]
+        merged_http = [u for u in merged_http if not is_pinned(u)]
 
-        # 顺序 = 公开直连 → 钉住的官方 CDN → 固定条目
+        # 境外的排到最后：只当兜底，永不优先（详见 find_foreign_hosts 注释）
+        domestic = [u for u in merged_http if host_of(u) not in FOREIGN][:MAX_DIRECT]
+        overseas = [u for u in merged_http if host_of(u) in FOREIGN]
+
+        # 顺序 = 境内公开源 → 钉住的官方 CDN → 固定条目(sttv/webview) → 境外转播源
         #
         # 官方 CDN 不排第一是有实测依据的：央视官方源的 H.264 SPS 里
         # pic_order_cnt_type = 3（保留值，规范只允许 0/1/2），Android 9 模拟器的
@@ -439,7 +513,7 @@ def main():
         # ——App 不会自动切走。同一环境下公开源与其它台都正常。
         # 故官方源降级为「公开源全挂时」的后备层，避免绿屏卡死无人能救。
         merged = []
-        for u in merged_http + pinned + stable:
+        for u in domestic + pinned + stable + overseas:
             if u not in merged:
                 merged.append(u)
         if not merged:
@@ -450,14 +524,16 @@ def main():
         if merged_http:
             stats["direct_channels"] += 1
         stats["pinned"] += len(pinned)
-        stats["fresh"] += len(merged_http)
+        stats["fresh"] += len(domestic)
+        stats["overseas"] += len(overseas)
         stats["stable"] += len(stable)
 
     text = "\n".join(out_lines) + "\n"
 
     print(f"\n结果: {stats['pinned']} 条官方 CDN，"
-          f"{stats['direct_channels']} 个频道有公开 http 直连（共 {stats['fresh']} 条），"
-          f"固定条目 {stats['stable']} 条", file=sys.stderr)
+          f"{stats['direct_channels']} 个频道有公开 http 直连（境内 {stats['fresh']} 条"
+          + (f" / 境外 {stats['overseas']} 条" if stats["overseas"] else "")
+          + f"），固定条目 {stats['stable']} 条", file=sys.stderr)
 
     if dead_pinned:
         print(f"\n提示：{len(dead_pinned)} 条官方 CDN 三次重试后仍不可达（已保留，未删除）。", file=sys.stderr)
