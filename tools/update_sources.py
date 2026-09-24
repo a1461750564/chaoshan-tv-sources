@@ -163,10 +163,11 @@ def _get(url, timeout=10, limit=None):
 _VIDEO_STREAM_TYPES = {0x01, 0x02, 0x10, 0x1B, 0x1E, 0x24, 0x42, 0xD1, 0xEA}
 
 
-def ts_has_video(data: bytes):
-    """从 TS 分片判断有没有画面。
+def ts_video_types(data: bytes):
+    """从 TS 分片解析 PMT，返回其中的**视频**流类型列表。
 
-    返回 True=有视频 / False=纯音频 / None=判不了（非 TS，保守放行）
+    返回 []  = 确证没有视频（纯音频）
+    返回 None = 判不了（非 TS / 找不到 PMT，保守放行）
 
     为什么要查这个：公开源里混着一批 `…/audio/cctv3_2.m3u8` 这类**纯音频**地址，
     它们能通过前面三级检测（连通、真 HLS、首片能拉），但播出来是**黑屏只有声音**。
@@ -209,18 +210,54 @@ def ts_has_video(data: bytes):
                     types.append(s[i])
                     i += 5 + (((s[i + 3] & 0xf) << 8) | s[i + 4])
                 if types:
-                    return any(t in _VIDEO_STREAM_TYPES for t in types)
+                    return [t for t in types if t in _VIDEO_STREAM_TYPES]
             break
     return None
+
+
+# 编码「现代程度」排序用的档位。数字越小越靠前。
+# 0 = H.264/H.265（所有设备都能硬解，码率效率高）
+# 1 = 判不出来（非 TS 或找不到 PMT；保守放中间，不惩罚）
+# 2 = MPEG-2 / MPEG-4 / MPEG-1（老编码）
+#
+# 为什么要把 MPEG-2 往后放：实测 Android 9 的媒体解码器只声明支持
+# avc / hevc / mp4v-es / vp8 / vp9 / 3gpp，**没有 MPEG-2**——CCTV1 第一条线路
+# 换成某运营商 MPEG-2 源后，日志里只有 `audioDecoderInitialized`，画面全黑。
+# 真实电视盒子多半支持 MPEG-2，但既然有得选，就优先选设备一定能解的。
+_MODERN = {0x1B, 0x1E, 0x24}          # H.264 / H.264-MVC / H.265
+_LEGACY = {0x01, 0x02, 0x10}          # MPEG-1 / MPEG-2 / MPEG-4
+
+
+def codec_rank(types):
+    if not types:
+        return 1
+    if any(t in _MODERN for t in types):
+        return 0
+    if any(t in _LEGACY for t in types):
+        return 2
+    return 1
+
+
+# 分段探测分片时的参数
+_SEG_CHUNK = 32 * 1024
+_SEG_MAX = 128 * 1024
 
 
 def first_segment(url, text, depth=0):
     """拉取「首个真正能播的片段」，返回 (url, content_type, 数据) 或 None。
 
-    很多源是**主播放列表**（外层 m3u8 列的是不同码率的子播放列表，子播放列表才是切片）。
-    只下钻一层、把子播放列表当切片去拉，拿回来还是 m3u8，就会被误判成"拉不到"。
-    实测广东的源里大量是这种结构（`epg.pw`、`jdshipin` 等），
-    修掉它对所有频道的候选命中率都有帮助，不只是广东。
+    两件事都得在这里做完，**且只能用一次请求**：
+
+    ① **主播放列表下钻**：很多源是「外层 m3u8 → 子 m3u8 → 切片」的嵌套结构，
+       只下钻一层就当成切片去拉、拿回 m3u8 便误判成"拉不到"。实测广东的源里
+       大量是这种（`epg.pw`、`jdshipin` 等），修掉它对所有频道都有帮助。
+
+    ② **找到 PMT 就提前停**：有的源 PSI 很稀疏（广东移动那条第一片的 PAT
+       要到 61KB 处才出现），固定读一个长度会时对时错。
+
+    ⚠️ 曾经踩的坑：早期实现是「先小读一段判断嵌套，不是嵌套再发一次请求读全」——
+    对直播流是致命的，两次请求之间那条 6 秒窗口的分片已经过期，
+    第二次直接 404，实测让通过数从 189 条掉到 166 条。所以必须单次请求读到尾。
 
     depth 限制 2 层，防止自引用导致死循环。
     """
@@ -229,16 +266,30 @@ def first_segment(url, text, depth=0):
     if not segs or len(segs) > 300:                                 # 分片数合理
         return None                                                 # 超过 300 基本是点播切片
     seg_url = urljoin(url, segs[0])
-    st, ct, body = _get(seg_url, 12, 65536)
-    if st != 200:
-        return None
-    if body.lstrip()[:7] == b"#EXTM3U" and depth < 2:               # 还是播放列表 → 下钻
-        return first_segment(seg_url, body.decode("utf-8", "ignore"), depth + 1)
-    return seg_url, ct, body
+
+    r = urllib.request.urlopen(
+        urllib.request.Request(seg_url, headers={"User-Agent": UA}), timeout=12)
+    ct = r.headers.get("Content-Type", "")
+    buf = b""
+    checked_nesting = False
+    while len(buf) < _SEG_MAX:
+        part = r.read(_SEG_CHUNK)
+        if not part:
+            break
+        buf += part
+        # ① 第一次读就够判断是不是嵌套播放列表（播放列表都很小）
+        if not checked_nesting:
+            checked_nesting = True
+            if buf.lstrip()[:7] == b"#EXTM3U" and depth < 2:
+                return first_segment(seg_url, buf.decode("utf-8", "ignore"), depth + 1)
+        # ② 拿到 PMT 就可以停了
+        if ts_video_types(buf) is not None:
+            break
+    return seg_url, ct, buf
 
 
 def probe(item):
-    """通过返回 (频道名, url)，否则 None
+    """通过返回 (频道名, url, 编码档位)，否则 None
 
     只看 HTTP 200 会得到约 97% 的假可用率 —— 必须验到分片一级。
     """
@@ -257,9 +308,11 @@ def probe(item):
         # ⑤ 要有画面。注意判据是「TS 同步字节 + PMT」，不认 content-type ——
         #    不少源把 TS 分片标成 text/plain 或干脆不给 type，卡 content-type 会误杀。
         if seg[:1] == b"\x47" or ct2.startswith("video") or ct2.startswith("octet"):
-            if ts_has_video(seg) is False:
+            types = ts_video_types(seg)
+            if types == []:
                 return None                                         #    PMT 里只有音频流
-            return (name, url)
+            # 编码档位交给合并阶段排序用（H.264/H.265 优先，MPEG-2 往后）
+            return (name, url, codec_rank(types))
     except Exception:
         pass
     return None
@@ -449,14 +502,21 @@ def main():
                     dead_pinned.append(u)
         print(f"官方 CDN 复检完成：{len(pinned_todo)-len(dead_pinned)} 条存活", file=sys.stderr)
 
+    # 按编码档位排序后再取前 MAX_DIRECT 条：
+    # H.264/H.265 优先（所有设备都能硬解），MPEG-2/MPEG-4 往后压。
+    # 用 sorted 是稳定排序，同档位内保持探测时的原顺序。
+    ranked = sorted(results, key=lambda r: r[2])
+
     fresh = OrderedDict()
-    for n, u in results:
+    rank_of = {}
+    for n, u, rank in ranked:
         fresh.setdefault(n, [])
+        rank_of[u] = rank
         if len(fresh[n]) < MAX_DIRECT:
             fresh[n].append(u)
 
     # 查一遍主机归属地，把境外转播源降到最后（详见 find_foreign_hosts 注释）
-    all_hosts = {host_of(u) for n, u in results}
+    all_hosts = {host_of(u) for _n, u, _r in results}
     all_hosts |= {host_of(u) for _g, _n, us in skeleton for u in us
                   if u.startswith("http")}
     all_hosts.discard("")
