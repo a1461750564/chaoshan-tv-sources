@@ -57,7 +57,22 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add builtin_iptv.txt
           git commit -m "chore: 自动更新直播源 $(date -u '+%Y-%m-%d')"
-          git push
+
+          # 流水线要跑 3 分多钟，若这期间远端有新提交（例如人工推送），
+          # 直接 push 会被拒。重试：先并入远端，冲突时以本地产物为准
+          # —— 我方是刚测出来的结果，比远端旧版权威。
+          for i in 1 2 3; do
+            if git push; then
+              echo "推送成功"
+              exit 0
+            fi
+            echo "::warning::推送被拒，同步远端后重试（$i/3）"
+            git fetch origin
+            git merge --strategy-option=ours "origin/${{ github.ref_name }}" \
+                      --no-edit -m "chore: 合并远端后再推送"
+          done
+          echo "::error::重试 3 次仍无法推送"
+          exit 1
 
       # 供 App 直接拉取的稳定地址（raw.githubusercontent.com 会缓存几分钟）
       - name: 输出拉取地址
