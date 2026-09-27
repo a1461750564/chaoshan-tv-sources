@@ -22,7 +22,9 @@
   且不触发 onError，排第一会卡死）。单独、低并发、带 3 次重试地复检
   （不能和大批候选一起高并发扫——实测那样会有约 20% 的假阴性）；
   即使复检仍失败也**保留不删**，只打印告警让人确认。
-- **稳定（stable）**：`sttv://` 客户端签名源、`webview://` 官方网页兜底。原样保留，排最后。
+- **稳定（stable）**：`sttv://` 客户端签名源。原样保留，排最后。
+  **注意**：`webview://` 官方网页在 Android 9 实测不可用（索贝云播放器报错、
+  广东台 WASM SIMD 编译失败），已从流水线移除，不再作为兜底。
 
 用法
 ----
@@ -568,7 +570,8 @@ def main():
         # 远小于因瞬时网络抖动误删一条好线路（实测假阴性率约 20%）。
         pinned = [u for u in urls if is_pinned(u)]
 
-        stable = [u for u in urls if not u.startswith("http")]   # sttv:// / webview://
+        # 只保留 sttv:// 动态源，不保留 webview://（实测 Android 9 上 webview 播放器不可用）
+        stable = [u for u in urls if u.startswith("sttv://")]
         skeleton_http = [u for u in urls if u.startswith("http") and not is_pinned(u)]
 
         # 所有通过三级检测的 http 线路合并去重：新测的优先，骨架里测活过的补位
@@ -586,13 +589,16 @@ def main():
         domestic = [u for u in merged_http if host_of(u) not in FOREIGN][:MAX_DIRECT]
         overseas = [u for u in merged_http if host_of(u) in FOREIGN]
 
-        # 顺序 = 境内公开源 → 钉住的官方 CDN → 固定条目(sttv/webview) → 境外转播源
+        # 顺序 = 境内公开源 → 钉住的官方 CDN → 汕头 sttv:// → 境外转播源
         #
         # 官方 CDN 不排第一是有实测依据的：央视官方源的 H.264 SPS 里
         # pic_order_cnt_type = 3（保留值，规范只允许 0/1/2），Android 9 模拟器的
         # 软解（Media3 与 IJK 都一样）只能解出亮度平面，整屏纯绿、且不触发 onError
         # ——App 不会自动切走。同一环境下公开源与其它台都正常。
         # 故官方源降级为「公开源全挂时」的后备层，避免绿屏卡死无人能救。
+        #
+        # webview:// 不再保留：实测 Android 9 上索贝云播放器报 Unable to play、
+        # 广东台 WASM SIMD 编译失败黑屏，webview 黑屏比没画面更糟（老人会以为电视坏了）。
         merged = []
         for u in domestic + pinned + stable + overseas:
             if u not in merged:
